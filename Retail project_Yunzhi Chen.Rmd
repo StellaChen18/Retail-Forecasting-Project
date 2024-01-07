@@ -1,0 +1,321 @@
+---
+title: "Retail forecasting project"
+author: "Yunzhi Chen 32051018"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: show
+---
+
+```{r global_setting, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  error = FALSE,
+  fig.align = "center"
+)
+```
+
+```{r libraries, warning = FALSE, message = FALSE, class.source = 'fold-hide'}
+library(tidyverse)
+library(fpp3)
+library(patchwork)
+library(fable)
+library(lubridate)
+```
+
+```{r setup}
+# Use your student ID as the seed
+set.seed(32051018)
+myseries <- aus_retail %>%
+  # Remove discontinued series
+  filter(!(`Series ID` %in% c("A3349561R","A3349883F","A3349499L","A3349902A",
+                        "A3349588R","A3349763L","A3349372C","A3349450X",
+                        "A3349679W","A3349378T","A3349767W","A3349451A"))) %>%
+  # Select a series at random
+  filter(`Series ID` == sample(`Series ID`,1))
+```
+
+# Statistical features
+```{r, class.source = 'fold-hide'}
+p1 <- myseries %>% 
+  autoplot(Turnover) +
+  labs(title = "Plot of aus_retail",
+       y = "Turnover($ Millions)")
+
+p2 <- myseries %>%
+   ACF(Turnover) %>%
+   autoplot() +
+   labs(title = "ACF plot",
+        y = "Turnover($ Millions)")
+
+p1/p2
+```
+
+From the graph of my Australian retail series, we can see in general, the turnover of Australian retail has an increasing trend. The series appears to have a seasonal pattern. The variability in the data appears proportional to the amount of turnover over the period. In 2006 and 2015 there was a significant decrease in turnover compared to the previous 1 month and then a gradual increase over time.
+
+As for the ACF plot, the obvious trend indicates the seasonality of the series as well. 
+Besides, the spikes are not within the blue dash line revealing the fact of no white noise.
+
+# Transformation and differencing
+```{r}
+# Box-Cox transformation 
+lambda <- myseries %>%
+  features(Turnover, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+# Unit-root test for seasonal differencing
+myseries %>%
+  features(box_cox(Turnover, lambda), unitroot_nsdiffs)
+
+# Unit-root test for regular differencing
+myseries %>%
+  features(difference(box_cox(Turnover, lambda), 12), unitroot_ndiffs)
+
+# ACF
+myseries %>%
+  ACF(difference(box_cox(Turnover, lambda), 12)) %>%
+  autoplot() +
+  labs(title = "The ACF plot after seasonal differencing",
+       y = "Turnover($ Millions)")
+
+# Differencing
+myseries %>%
+  gg_tsdisplay(difference(difference(box_cox(Turnover, lambda), 12)), plot_type = "partial", lag = 36) +
+  labs(title = "The series after transformation and differencing",
+       y = "Turnover($ Millions)")
+```
+
+As the series is non-stationary data, we can use the 3 steps to make it stationary. First, by box_cox transformation, we change the variance. For determining whether seasonal differencing is required, we use `unitroot_nsdiffs()` function, and `unitroot_ndiffs()` to determine ordinary differencing. Although the result of a unit-root test for ordinary differencing is 0 which indicates we do not need the last step for regular differencing, the ACF plot shows the data is still non-stationary. After the seasonally differencing which removes the seasonality (step 2), we can apply the regular differencing for the series to remove the trend and anything else. The final plot shows the stationary.
+
+# A short-list of appropriate ARIMA models and ETS models
+```{r}
+# split into train and test data
+myseries_train <- myseries %>%
+  filter(year(Month) <= 2016)
+myseries_test <- myseries %>%
+  filter(year(Month) > 2016)
+```
+
+### ARIMA models
+```{r}
+ARIMA_fit <- myseries_train %>%
+  model(
+    arima011011 = ARIMA(box_cox(Turnover, lambda) ~ pdq(0,1,1) + PDQ(0,1,1)),
+    arima110011 = ARIMA(box_cox(Turnover, lambda) ~ pdq(1,1,0) + PDQ(0,1,1)),
+    auto = ARIMA(box_cox(Turnover, lambda), 
+                 stepwise = FALSE, 
+                 approx = FALSE)
+  )
+
+glance(ARIMA_fit) %>% arrange(AICc) %>% select(.model:BIC)
+
+forecast(ARIMA_fit, h = 24) %>%
+  autoplot(myseries_test, level = NULL) +
+  labs(title = "ARIMA Forecastiong of New South Wales turnover from 2017 to 2018",
+       y = "Turnover($ Millions)") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+For P and Q, there is a significant spike at lag 12 in the ACF, and decreasing spikes at lags 12, 24 and 36 in the PACF. This suggests Q=1 and P=0.
+For p and q, we can see the lags up to the seasonal period. So lags 1-11 can indicates there is a significant spike at lag 1 in the ACF, plus two smaller ones at 7 and 11. There is a significant spike at lags 1 and 2 in the PACF, plus a small one at 11. If we ignore the small spikes at lags 7 and 11, this looks like q=1 and p=0. So my starting point would be ARIMA(0,1,1)(0,1,1)[12]. Same with the second model choosen. We will also include an automatically selected model. By setting `stepwise=FALSE` and `approximation=FALSE`, we are making R work extra hard to find a good model. 
+
+Comparing the AIC, AICc, and BIC values, we can see that the model "arima110011" has the lowest values for all three criteria, which is considered the best fit among the three models.
+
+The plot shows the forecasting of 3 ARIMA models applying to a test-set consisting of the last 24 months.
+
+### ETS models
+```{r}
+ETS_fit <- myseries_train %>%
+  model(
+    multiplicative = ETS(Turnover ~ error("M") + trend("A") + season("M")),
+    hw = ETS(Turnover ~ error("M") + trend("Ad") + season("M")),
+    auto = ETS(Turnover)
+  )
+
+glance(ETS_fit) %>% arrange(AICc) %>% select(.model:BIC)
+
+
+forecast(ETS_fit, h = 24) %>%
+  autoplot(myseries_test, level = NULL) +
+  labs(title = "ETS Forecastiong of New South Wales turnover from 2017 to 2018",
+       y = "Turnover($ Millions)") +
+  guides(colour = guide_legend(title = "Forecast"))
+
+```
+
+As the data shows seasonality and there is evidence of multiplicative error, I choose the Holt-Winters’ multiplicative method and Holt’s linear method with multiplicative errors to generate corresponding ETS models. Besides, including an automatically selected model as well.
+
+In this case, where the AIC and AICc for Holt’s linear method with multiplicative errors and auto ETS are the same and lowest, we can conclude that these models provide similar fits to the data based on the information criteria alone.
+
+The plot shows the forecasting of 3 ETS models applying to a test-set consisting of the last 24 months.
+
+# One ARIMA model and one ETS model
+### ARIMA model
+```{r}
+# Parameter estimates
+best_ARIMA <- myseries_train %>% 
+  model(arima110011 = ARIMA(box_cox(Turnover, lambda) ~ pdq(0,1,1) + PDQ(0,1,1)))
+report(best_ARIMA)
+glance(best_ARIMA)
+
+# ACF plot
+gg_tsresiduals(best_ARIMA) +
+  labs(title = "ACF plot of Best ARIMA model",
+       y = "Turnover($ Millions)")
+
+# Ljung-Box test
+augment(best_ARIMA) %>% 
+  features(.innov, ljung_box, lag = 24, dof = 4)
+
+# Prediction intervals
+forecast(best_ARIMA, h = 24, bootstrap = TRUE) %>%
+  autoplot(myseries_test, level = NULL) +
+  labs(title = "The best ARIMA Forecastiong",
+       y = "Turnover($ Millions)")
+```
+
+### ETS model
+```{r}
+# Parameter estimates
+best_ETS <- myseries_train %>% 
+  model(hw = ETS(Turnover ~ error("M") + trend("Ad") + season("M"))) 
+report(best_ETS)
+glance(best_ETS)
+
+# ACF plot
+gg_tsresiduals(best_ETS)+
+  labs(title = "ACF plot of Best ETS model",
+       y = "Turnover($ Millions)")
+
+# Ljung-Box test
+augment(best_ETS) %>% 
+  features(.innov, ljung_box, lag = 24, dof = 4)
+
+# Prediction intervals
+forecast(best_ETS, h = 24, bootstrap = TRUE) %>%
+  autoplot(myseries_test, level = NULL) +
+  labs(title = "The best ETS Forecastiong",
+       y = "Turnover($ Millions)")
+```
+
+# ARIMA vs ETS
+```{r}
+bind_rows(
+    best_ARIMA %>% accuracy(),
+    best_ETS %>% accuracy(),
+    best_ARIMA %>% forecast(h = 24) %>% accuracy(myseries_test),
+    best_ETS %>% forecast(h = 24) %>% accuracy(myseries_test)
+  ) %>%
+  select(-ME, -MPE, -ACF1)
+```
+
+The output above evaluates the forecasting performance of the two competing models over the test set. In this case the chosen ETS model seems to be the slightly more accurate model based on the test set RMSE, MAPE and MASE.
+
+# Full data forecasting
+### ARIMA model
+```{r}
+ARIMA_fit_all <- myseries %>%
+  model(ARIMA = ARIMA(box_cox(Turnover, lambda) ~ pdq(1,1,0) + PDQ(0,1,1)))
+report(ARIMA_fit_all)
+
+ARIMA_fit_all %>%
+  forecast(h = 24, point_forecast = lst(mean, median)) %>%
+  hilo(level = 80)
+
+ ARIMA_fit_all %>%
+  forecast(h = 24) %>%
+  autoplot(myseries, level = 80) + 
+  labs(title = "ARIMA forecasting for full data",
+       y = "Turnover($ Millions)")
+```
+
+### ETS model
+```{r}
+ETS_fit_all <- myseries %>%
+  model(ETS = ETS(Turnover ~ error("M") + trend("Ad") + season("M")))
+report(ETS_fit_all)
+
+ETS_fit_all %>%
+  forecast(h = 24, point_forecast = lst(mean, median)) %>% 
+  hilo(level = 80) 
+
+ETS_fit_all %>%
+  forecast(h = 24) %>%
+  autoplot(myseries, level = 80)+ 
+  labs(title = "ETS forecasting for full data",
+       y = "Turnover($ Millions)")
+```
+
+# Comparision with ABS data
+```{r ABS_data, class.source = 'fold-hide'}
+updated_data <- readxl::read_excel("ABSdata.xls", 
+                                   sheet = "Data1", 
+                                   skip = 9) %>%
+  select(Month = `Series ID`, Turnover = myseries$`Series ID`[1]) %>%
+  mutate(
+    Month = yearmonth(Month),
+    State = myseries$State[1],
+    Industry = myseries$Industry[1]
+  ) %>%
+  as_tsibble(index = Month, key = c(State, Industry))
+```
+
+### ARIMA model
+```{r}
+# Residual diagnostics
+augment(ARIMA_fit_all) %>% 
+  features(.innov, ljung_box, lag = 24, dof = 4)
+gg_tsresiduals(ARIMA_fit_all) + 
+  labs(title = "ACF plot of ARIMA fit",
+       y = "Turnover($ Millions)")
+
+# Accuracy
+ARIMA_fit_all %>% forecast(h = 24) %>% accuracy(updated_data)
+```
+
+### ETS model
+```{r}
+# Residual diagnostics
+augment(ETS_fit_all) %>% 
+  features(.innov, ljung_box, lag = 24, dof = 4)
+gg_tsresiduals(ETS_fit_all)+ 
+  labs(title = "ACF plot of ETS fit",
+       y = "Turnover($ Millions)")
+
+# Accuracy
+ETS_fit_all %>% forecast(h = 24) %>% accuracy(updated_data)
+```
+
+### Forecasting plots
+```{r}
+
+p5 <- forecast(ARIMA_fit_all, h = 24, bootstrap = TRUE) %>%
+  autoplot(updated_data, level = NULL) +
+  labs(title = "ARIMA Forecastiong from 2018 to 2020",
+       y = "Turnover($ Millions)")
+
+p6 <- forecast(ETS_fit_all, h = 24, bootstrap = TRUE) %>%
+  autoplot(updated_data, level = NULL) +
+  labs(title = "ETS Forecastiong from 2018 to 2020",
+       y = "Turnover($ Millions)")
+
+p5/p6
+```
+
+By performing residual diagnostics, calculating accuracy, and plotting prediction images for ARIMA and ETS models respectively, we can first see from the histogram that the residual of the ARIMA model shows a more normal distribution, while the ETS model is slightly right-skewed. The accuracy is also a significant advantage of ARIMA fit. Finally, We can also see from the plot of forecasting that the ARIMA model's predictions are more consistent with the actual data. 
+
+# Benefits and limitations
+For the ARIMA model,
+
+- Benefit: ARIMA model is relatively robust against outliers and missing data, as they are designed to handle irregularities in the time series.
+
+- Limitation: As we can see from the Ljung_box test of the ARIMA model applying for updated data, the result is significant (i.e. the p-value is less than 0.05), which means the residuals appear not to be white noise. That may infect the prediction. Besides, due to the iterative nature of the parameter estimation process, it may take a longer time to calculate for the ARIMA model if the dataset is larger.
+
+On the other hand, for the ETS model,
+
+- Benefit: ETS model is well-suited for forecasting time series with strong seasonal patterns, no matter additive or multiplicative seasonal components.
+
+- Limitation: ETS model does not enforce stationary on the time series data, While explicit differencing or transformations may be required for better results. As well as the same limitation as the ARIMA model, the Ljung_box test output indicates the residuals appear not to be white noise.
